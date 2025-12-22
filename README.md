@@ -11,6 +11,7 @@ A terminal-based real-time messaging application built with Go.
 - **Beautiful TUI** built with Bubbletea
 - **PostgreSQL** for persistent storage
 - **Easy installation** with a single command
+- **Configurable server** directly on login screen
 
 ## Quick Start
 
@@ -20,21 +21,40 @@ A terminal-based real-time messaging application built with Go.
 curl -sSL https://raw.githubusercontent.com/cloudzz-dev/cldzmsg/master/install.sh | bash
 ```
 
-### Set Server
-
-```bash
-export CLDZMSG_SERVER=ws://your-server-ip:8080/ws
-```
-
 ### Run
 
 ```bash
 cldzmsg
 ```
 
-## Server Setup (Raspberry Pi 5)
+On the login screen, you can configure:
+- **Server URL** (default: `wss://cldzmsg.cloudzz.dev/ws`)
+- **Username** and **Password**
 
-### Prerequisites
+Use **Tab** to cycle between fields.
+
+## Server Deployment
+
+### Docker (Recommended)
+
+```bash
+# Clone the repository
+git clone https://github.com/cloudzz-dev/cldzmsg.git
+cd cldzmsg
+
+# Deploy with the automated script
+./deploy.sh
+```
+
+The deploy script will:
+- Check and install dependencies (Docker, Docker Compose, Git)
+- Build and start the server on port **3567**
+- Run health checks
+- Commit and push changes
+
+### Manual Setup (Raspberry Pi 5)
+
+#### Prerequisites
 
 ```bash
 # Install PostgreSQL
@@ -47,7 +67,7 @@ sudo -u postgres createdb cldzmsg
 sudo -u postgres psql cldzmsg < internal/db/schema.sql
 ```
 
-### Run Server
+#### Run Server
 
 ```bash
 # Set database URL
@@ -90,9 +110,9 @@ sudo systemctl start cldzmsg
 ### Auth Screen
 | Key | Action |
 |-----|--------|
-| Tab | Switch fields |
+| Tab | Cycle through Server → Username → Password |
 | Ctrl+R | Toggle Login/Register |
-| Enter | Submit |
+| Enter | Connect and Submit |
 | q | Quit |
 
 ### Conversations

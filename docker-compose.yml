@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cldzmsg-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cldzmsg
+      POSTGRES_USER: cldzmsg
+      POSTGRES_PASSWORD: cldzmsg_secret_change_me
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./internal/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U cldzmsg -d cldzmsg" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: cldzmsg-server
+    restart: unless-stopped
+    ports:
+      - "3567:3567"
+    environment:
+      DATABASE_URL: postgres://cldzmsg:cldzmsg_secret_change_me@postgres:5432/cldzmsg?sslmode=disable
+      PORT: "3567"
+      # Rate limiting
+      MAX_CONNECTIONS_PER_IP: "10"
+      AUTH_ATTEMPTS_PER_MIN: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
