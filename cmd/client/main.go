@@ -26,8 +26,9 @@ import (
 // --- Session Persistence ---
 
 type Session struct {
-	Username string `json:"username"`
-	Password string `json:"password"` // Stored for auto-login (consider encrypting in production)
+	ServerURL string `json:"server_url"`
+	Username  string `json:"username"`
+	Password  string `json:"password"` // Stored for auto-login (consider encrypting in production)
 }
 
 var profileName = "default"
@@ -141,7 +142,7 @@ func loadSession() *Session {
 		var session Session
 		if err := json.Unmarshal(data, &session); err == nil {
 			// Migration: re-save encrypted immediately
-			saveSession(session.Username, session.Password)
+			saveSession(session.ServerURL, session.Username, session.Password)
 			return &session
 		}
 		return nil
@@ -154,7 +155,7 @@ func loadSession() *Session {
 	return &session
 }
 
-func saveSession(username, password string) error {
+func saveSession(serverURL, username, password string) error {
 	configDir := getConfigDir()
 	if configDir == "" {
 		return fmt.Errorf("could not get config directory")
@@ -164,7 +165,7 @@ func saveSession(username, password string) error {
 		return err
 	}
 
-	session := Session{Username: username, Password: password}
+	session := Session{ServerURL: serverURL, Username: username, Password: password}
 	data, err := json.Marshal(session)
 	if err != nil {
 		return err
@@ -441,6 +442,14 @@ type model struct {
 type wsReconnect struct{}
 
 func initialModel(serverURL string) model {
+	// Load saved session
+	savedSession := loadSession()
+
+	// Override default serverURL if saved session exists
+	if savedSession != nil && savedSession.ServerURL != "" {
+		serverURL = savedSession.ServerURL
+	}
+
 	serverInput := textinput.New()
 	serverInput.Placeholder = "wss://cldzmsg.cloudzz.dev/ws"
 	if serverURL != "" {
@@ -454,11 +463,17 @@ func initialModel(serverURL string) model {
 
 	usernameInput := textinput.New()
 	usernameInput.Placeholder = "Username"
+	if savedSession != nil && savedSession.Username != "" {
+		usernameInput.SetValue(savedSession.Username)
+	}
 	usernameInput.CharLimit = 32
 	usernameInput.Width = 30
 
 	passwordInput := textinput.New()
 	passwordInput.Placeholder = "Password"
+	if savedSession != nil && savedSession.Password != "" {
+		passwordInput.SetValue(savedSession.Password)
+	}
 	passwordInput.EchoMode = textinput.EchoPassword
 	passwordInput.CharLimit = 64
 	passwordInput.Width = 30
@@ -474,9 +489,6 @@ func initialModel(serverURL string) model {
 	newConvInput.Width = 30
 
 	chatViewport := viewport.New(80, 20)
-
-	// Load saved session for auto-login
-	savedSession := loadSession()
 
 	infoInput := textinput.New()
 	infoInput.CharLimit = 32
@@ -552,7 +564,12 @@ func (m model) sendWSMessage(msgType string, payload interface{}) tea.Cmd {
 // --- Init ---
 
 func (m model) Init() tea.Cmd {
-	// Don't connect on startup - connection happens when user submits login form
+	if m.savedSession != nil {
+		return tea.Batch(
+			textinput.Blink,
+			connectToServer(m.serverURL),
+		)
+	}
 	return textinput.Blink
 }
 
@@ -970,7 +987,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Save session for future auto-login
 			if m.pendingPassword != "" {
-				saveSession(resp.Username, m.pendingPassword)
+				saveSession(m.serverURL, resp.Username, m.pendingPassword)
 				m.pendingPassword = ""
 			}
 
