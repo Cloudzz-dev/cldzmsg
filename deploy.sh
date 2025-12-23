@@ -261,12 +261,8 @@ commit_and_push() {
     git add -A
     
     echo -e "${BLUE}Committing changes...${NC}"
-    git commit -m "chore: add deploy script and server URL input on login screen
-
-- Added Server URL input field on login screen (Tab to cycle fields)
-- Default server: wss://cldzmsg.cloudzz.dev/ws
-- Created deploy.sh with dependency checking and auto-install
-- Connection now happens on form submit instead of startup"
+    local msg="chore: update deployment ($(date +%Y-%m-%d))"
+    git commit -m "$msg"
     
     echo -e "${BLUE}Pushing to remote...${NC}"
     if git push; then
