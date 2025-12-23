@@ -24,6 +24,20 @@ type Session struct {
 }
 
 var profileName = "default"
+var debugMode = false
+
+// debugLog writes to debug.log only if debug mode is enabled
+func debugLog(format string, args ...interface{}) {
+	if !debugMode {
+		return
+	}
+	f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, format+"\n", args...)
+}
 
 func getConfigDir() string {
 	home, err := os.UserHomeDir()
@@ -82,15 +96,13 @@ func clearSession() {
 var (
 	primaryColor   = lipgloss.Color("#7C3AED")
 	secondaryColor = lipgloss.Color("#10B981") // Green for self
-	otherColor     = lipgloss.Color("#3B82F6") // Blue for others
 	bgColor        = lipgloss.Color("#1F2937")
-	textColor      = lipgloss.Color("#F9FAFB")
 	mutedColor     = lipgloss.Color("#9CA3AF")
 	errorColor     = lipgloss.Color("#EF4444")
 	activeBorder   = lipgloss.Color("#F59E0B") // Amber for focus
 
 	// App container
-	appStyle = lipgloss.NewStyle().Padding(1, 2)
+	_ = lipgloss.NewStyle().Padding(1, 2)
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -114,9 +126,9 @@ var (
 			BorderForeground(primaryColor).
 			Padding(1, 2)
 
-	helpStyle = lipgloss.NewStyle().
-			Foreground(mutedColor).
-			Italic(true)
+	_ = lipgloss.NewStyle().
+		Foreground(mutedColor).
+		Italic(true)
 
 	// Sidebar styles
 	sidebarStyle = lipgloss.NewStyle().
@@ -153,23 +165,23 @@ var (
 			Padding(0, 1)
 
 	// Message Bubbles
-	ownBubbleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(secondaryColor).
-			Padding(0, 1).
-			MarginTop(1).
-			MarginLeft(4). // Indent from left
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(secondaryColor)
+	_ = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(secondaryColor).
+		Padding(0, 1).
+		MarginTop(1).
+		MarginLeft(4). // Indent from left
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(secondaryColor)
 
-	otherBubbleStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFFFFF")).
-				Background(otherColor).
-				Padding(0, 1).
-				MarginTop(1).
-				MarginRight(4). // Indent from right
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(otherColor)
+	_ = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(primaryColor).
+		Padding(0, 1).
+		MarginTop(1).
+		MarginRight(4). // Indent from right
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(primaryColor)
 
 	// Legacy styles for compatibility
 	ownMessageStyle = lipgloss.NewStyle().
@@ -178,13 +190,13 @@ var (
 				Foreground(primaryColor)
 
 	// Legacy selected style
-	selectedStyle = lipgloss.NewStyle().
-			Foreground(secondaryColor).
-			Bold(true)
+	_ = lipgloss.NewStyle().
+		Foreground(secondaryColor).
+		Bold(true)
 
-	timestampStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#D1D5DB")). // Light gray
-			Faint(true)
+	_ = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#D1D5DB")). // Light gray
+		Faint(true)
 )
 
 const asciiArt = `
@@ -263,9 +275,10 @@ type typingTimeoutMsg struct {
 
 type model struct {
 	// Connection
-	conn      *websocket.Conn
-	serverURL string
-	connected bool
+	conn           *websocket.Conn
+	serverURL      string
+	connected      bool
+	isReconnecting bool // Show reconnecting banner
 
 	// Auth
 	userID          int
@@ -296,11 +309,18 @@ type model struct {
 	sidebarWidth  int
 
 	// Chat
-	currentConvID   int
-	currentConvName string
-	messages        []Message
-	messageInput    textinput.Model
-	chatViewport    viewport.Model
+	currentConvID      int
+	currentConvName    string
+	messages           []Message
+	messageInput       textinput.Model
+	chatViewport       viewport.Model
+	lastReadMessageIDs map[int]int // conversationID -> last read messageID
+
+	// Search
+	showSearch    bool
+	searchInput   textinput.Model
+	searchQuery   string
+	searchResults []int // indices of matching messages
 
 	// New Conversation Overlay
 	showNewConv    bool
@@ -368,21 +388,28 @@ func initialModel(serverURL string) model {
 	infoInput.CharLimit = 32
 	infoInput.Width = 30
 
+	searchInput := textinput.New()
+	searchInput.Placeholder = "Search messages..."
+	searchInput.CharLimit = 100
+	searchInput.Width = 40
+
 	return model{
-		serverURL:     serverURL,
-		authAction:    "login",
-		serverInput:   serverInput,
-		usernameInput: usernameInput,
-		passwordInput: passwordInput,
-		messageInput:  messageInput,
-		newConvInput:  newConvInput,
-		infoInput:     infoInput,
-		chatViewport:  chatViewport,
-		focusedPane:   paneAuth, // Start at auth
-		savedSession:  savedSession,
-		sidebarWidth:  30,       // Fixed sidebar width
-		view:          viewAuth, // Initialize legacy view state
-		typingUsers:   make(map[int]string),
+		serverURL:          serverURL,
+		authAction:         "login",
+		serverInput:        serverInput,
+		usernameInput:      usernameInput,
+		passwordInput:      passwordInput,
+		messageInput:       messageInput,
+		newConvInput:       newConvInput,
+		infoInput:          infoInput,
+		searchInput:        searchInput,
+		chatViewport:       chatViewport,
+		focusedPane:        paneAuth, // Start at auth
+		savedSession:       savedSession,
+		sidebarWidth:       30,       // Fixed sidebar width
+		view:               viewAuth, // Initialize legacy view state
+		typingUsers:        make(map[int]string),
+		lastReadMessageIDs: make(map[int]int),
 	}
 }
 
@@ -390,9 +417,7 @@ func initialModel(serverURL string) model {
 
 func connectToServer(url string) tea.Cmd {
 	return func() tea.Msg {
-		f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "Dialing WebSocket: %s\n", url)
-		f.Close()
+		debugLog("Dialing WebSocket: %s", url)
 
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 		if err != nil {
@@ -415,9 +440,7 @@ func listenForMessages(conn *websocket.Conn) tea.Cmd {
 func (m model) sendWSMessage(msgType string, payload interface{}) tea.Cmd {
 	return func() tea.Msg {
 		if m.conn == nil {
-			f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			fmt.Fprintf(f, "FAILED to send message (%s): Connection is nil\n", msgType)
-			f.Close()
+			debugLog("FAILED to send message (%s): Connection is nil", msgType)
 			return nil
 		}
 
@@ -543,10 +566,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Auth View Handling
 		if !m.authenticated {
-			// DEBUG: Log key press
-			f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			fmt.Fprintf(f, "Key pressed: %q | Server: %q | User: %q | Pass: %q\n", msg.String(), m.serverInput.Value(), m.usernameInput.Value(), m.passwordInput.Value())
-			f.Close()
+			debugLog("Key pressed: %q | Server: %q | User: %q | Pass: %q", msg.String(), m.serverInput.Value(), m.usernameInput.Value(), m.passwordInput.Value())
 
 			switch msg.String() {
 			case "tab":
@@ -570,9 +590,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.authAction = "login"
 				}
 			case "enter":
-				f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				fmt.Fprintf(f, "Enter pressed. Values valid? %v\n", m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "")
-				f.Close()
+				debugLog("Enter pressed. Values valid? %v", m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "")
 
 				if m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "" {
 					m.isLoading = true // Set loading
@@ -580,10 +598,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingPassword = m.passwordInput.Value()
 					m.serverURL = m.serverInput.Value()
 
-					// Log debug
-					f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					fmt.Fprintf(f, "Attempting auth: Server=%s Action=%s User=%s\n", m.serverURL, m.authAction, m.usernameInput.Value())
-					f.Close()
+					debugLog("Attempting auth: Server=%s Action=%s User=%s", m.serverURL, m.authAction, m.usernameInput.Value())
 
 					// Connect to server, then auth will happen in wsConnected handler
 					return m, connectToServer(m.serverURL)
@@ -676,10 +691,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case paneChat:
+			// Handle search input first if active
+			if m.showSearch {
+				switch msg.String() {
+				case "esc":
+					m.showSearch = false
+					m.searchQuery = ""
+					m.searchResults = nil
+					m.messageInput.Focus()
+					m.updateChatViewport()
+					return m, nil
+				case "enter":
+					// Execute search
+					query := strings.ToLower(m.searchInput.Value())
+					m.searchQuery = query
+					m.searchResults = nil
+					for i, message := range m.messages {
+						if strings.Contains(strings.ToLower(message.Content), query) ||
+							strings.Contains(strings.ToLower(message.SenderUsername), query) {
+							m.searchResults = append(m.searchResults, i)
+						}
+					}
+					m.updateChatViewport()
+					return m, nil
+				}
+				m.searchInput, _ = m.searchInput.Update(msg)
+				return m, nil
+			}
+
 			switch msg.String() {
 			case "esc": // Back to sidebar navigation
 				m.focusedPane = paneSidebar
 				m.messageInput.Blur()
+			case "ctrl+f": // Toggle search
+				m.showSearch = true
+				m.searchInput.SetValue("")
+				m.searchInput.Focus()
+				m.messageInput.Blur()
+				return m, nil
 			case "i":
 				m.showInfo = true
 				m.infoMode = ""
@@ -727,14 +776,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateChatViewport()
 
 	case wsConnected:
-		// DEBUG: Log connection success
-		f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "WebSocket Connected successfully to %s\n", m.serverURL)
-		f.Close()
+		debugLog("WebSocket Connected successfully to %s", m.serverURL)
 
 		m.conn = msg.conn
 		m.connected = true
-		m.reconnectCount = 0 // Reset reconnect counter on successful connection
+		m.isReconnecting = false // Clear reconnecting state
+		m.reconnectCount = 0     // Reset reconnect counter on successful connection
 
 		// If we just submitted the login form (isLoading), send auth now
 		if m.isLoading {
@@ -767,43 +814,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connected = false
 		m.conn = nil
 
-		// DEBUG: Log connection error
-		f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "WebSocket Connection Error (Count: %d): %v\n", m.reconnectCount, msg.err)
-		f.Close()
+		debugLog("WebSocket Connection Error (Count: %d): %v", m.reconnectCount, msg.err)
 
 		if m.reconnectCount < 5 {
 			m.reconnectCount++
+			m.isReconnecting = true
 			delay := time.Second * time.Duration(m.reconnectCount)
 			return m, tea.Tick(delay, func(t time.Time) tea.Msg {
 				return wsReconnect{}
 			})
 		}
+		m.isReconnecting = false
 		m.err = msg.err
 		return m, nil
 
 	case wsReconnect:
+		m.isReconnecting = true
 		return m, connectToServer(m.serverURL)
 
 	case wsIncoming:
-		// DEBUG: Log incoming message
-		f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "Received WS Message: %s\n", string(msg.data))
-		f.Close()
+		debugLog("Received WS Message: %s", string(msg.data))
 
 		var wsMsg struct {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(msg.data, &wsMsg); err != nil {
-			f, _ := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			fmt.Fprintf(f, "JSON Error: %v\n", err)
-			f.Close()
+			debugLog("JSON Error: %v", err)
 			return m, nil
 		}
 
-		f, _ = os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		fmt.Fprintf(f, "Processing Message Type: %s\n", wsMsg.Type)
-		f.Close()
+		debugLog("Processing Message Type: %s", wsMsg.Type)
 
 		switch wsMsg.Type {
 		case "auth_success":
@@ -882,6 +922,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				conv := m.conversations[foundIdx]
 				if resp.Message.ConversationID != m.currentConvID {
 					conv.UnreadCount++
+					// Play terminal bell for messages in other conversations
+					if resp.Message.SenderID != m.userID {
+						fmt.Print("\a") // Terminal bell
+					}
 				}
 				conv.LastMessage = &resp.Message
 
@@ -940,20 +984,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Update text inputs
-	if !m.authenticated {
-		if m.authFocused == 0 {
-			m.usernameInput, _ = m.usernameInput.Update(msg)
-		} else {
-			m.passwordInput, _ = m.passwordInput.Update(msg)
-		}
-	} else if m.showNewConv {
-		m.newConvInput, _ = m.newConvInput.Update(msg)
-	} else if m.focusedPane == paneChat {
-		m.messageInput, _ = m.messageInput.Update(msg)
-		m.chatViewport, _ = m.chatViewport.Update(msg)
-	}
-
 	return m, tea.Batch(cmds...)
 }
 
@@ -965,7 +995,7 @@ func (m *model) updateChatViewport() {
 func (m *model) renderChatContent() string {
 	var content strings.Builder
 	for _, msg := range m.messages {
-		timestamp := msg.CreatedAt.Format("15:04")
+		timestamp := formatRelativeTime(msg.CreatedAt)
 		var style lipgloss.Style
 		if msg.SenderID == m.userID {
 			style = ownMessageStyle
@@ -989,6 +1019,27 @@ func (m *model) renderChatContent() string {
 		content.WriteString(line + "\n")
 	}
 	return content.String()
+}
+
+// formatRelativeTime returns a human-readable relative timestamp
+func formatRelativeTime(t time.Time) string {
+	now := time.Now()
+	diff := now.Sub(t)
+
+	switch {
+	case diff < time.Minute:
+		return "now"
+	case diff < time.Hour:
+		mins := int(diff.Minutes())
+		return fmt.Sprintf("%dm", mins)
+	case diff < 24*time.Hour:
+		hours := int(diff.Hours())
+		return fmt.Sprintf("%dh", hours)
+	case diff < 48*time.Hour:
+		return "Yesterday " + t.Format("15:04")
+	default:
+		return t.Format("Jan 2 15:04")
+	}
 }
 
 // Simple word wrap helper
@@ -1020,17 +1071,17 @@ func (m model) View() string {
 	)
 
 	if m.showHelp {
-		return m.overlayHelp(mainView)
+		return m.overlayHelp()
 	}
 
 	if m.showInfo {
-		return m.overlayInfo(mainView)
+		return m.overlayInfo()
 	}
 
 	return mainView
 }
 
-func (m model) overlayHelp(base string) string {
+func (m model) overlayHelp() string {
 	width := 50
 	height := 16
 
@@ -1071,23 +1122,24 @@ func (m model) overlayHelp(base string) string {
 	)
 }
 
-func (m model) overlayInfo(base string) string {
+func (m model) overlayInfo() string {
 	width := 50
 	height := 14
 
 	var s strings.Builder
 	s.WriteString(titleStyle.Render("Conversation Options") + "\n\n")
 
-	if m.infoMode == "" {
+	switch m.infoMode {
+	case "":
 		s.WriteString("  [r] Rename Group\n")
 		s.WriteString("  [a] Add User\n")
 		s.WriteString("  [L] Leave Conversation\n\n")
 		s.WriteString(mutedStyle.Render("  Esc to cancel"))
-	} else if m.infoMode == "rename" {
+	case "rename":
 		s.WriteString("New Name:\n")
 		s.WriteString(m.infoInput.View())
 		s.WriteString("\n\n" + mutedStyle.Render("Enter to save, Esc to cancel"))
-	} else if m.infoMode == "add_user" {
+	case "add_user":
 		s.WriteString("Add User:\n")
 		s.WriteString(m.infoInput.View())
 		s.WriteString("\n\n" + mutedStyle.Render("Enter to add, Esc to cancel"))
@@ -1176,7 +1228,11 @@ func (m model) chatWindowView() string {
 	}
 
 	// Header
-	header := headerStyle.Render("💬 " + m.currentConvName)
+	headerText := "💬 " + m.currentConvName
+	if m.isReconnecting {
+		headerText = fmt.Sprintf("⟳ Reconnecting (%d/5)... | %s", m.reconnectCount, m.currentConvName)
+	}
+	header := headerStyle.Render(headerText)
 
 	// Typing Status
 	typingStatus := ""
@@ -1273,6 +1329,7 @@ func (m model) newConversationView() string {
 func main() {
 	// Parse flags
 	flag.StringVar(&profileName, "profile", "default", "Profile name for session isolation")
+	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging to debug.log")
 	flag.Parse()
 
 	serverURL := os.Getenv("CLDZMSG_SERVER")

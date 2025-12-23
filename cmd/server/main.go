@@ -3,9 +3,12 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,6 +16,125 @@ import (
 	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// --- Rate Limiter ---
+
+type RateLimiter struct {
+	connections  map[string]int         // IP -> connection count
+	authAttempts map[string][]time.Time // IP -> timestamps of auth attempts
+	mu           sync.RWMutex
+	maxConns     int
+	maxAuth      int
+}
+
+func newRateLimiter() *RateLimiter {
+	maxConns := 10
+	if v := os.Getenv("MAX_CONNECTIONS_PER_IP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxConns = n
+		}
+	}
+
+	maxAuth := 5
+	if v := os.Getenv("AUTH_ATTEMPTS_PER_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxAuth = n
+		}
+	}
+
+	rl := &RateLimiter{
+		connections:  make(map[string]int),
+		authAttempts: make(map[string][]time.Time),
+		maxConns:     maxConns,
+		maxAuth:      maxAuth,
+	}
+
+	// Cleanup old auth attempts every minute
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			rl.cleanup()
+		}
+	}()
+
+	return rl
+}
+
+func (rl *RateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	cutoff := time.Now().Add(-time.Minute)
+	for ip, attempts := range rl.authAttempts {
+		var valid []time.Time
+		for _, t := range attempts {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.authAttempts, ip)
+		} else {
+			rl.authAttempts[ip] = valid
+		}
+	}
+}
+
+func (rl *RateLimiter) canConnect(ip string) bool {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	return rl.connections[ip] < rl.maxConns
+}
+
+func (rl *RateLimiter) addConnection(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.connections[ip]++
+}
+
+func (rl *RateLimiter) removeConnection(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.connections[ip]--
+	if rl.connections[ip] <= 0 {
+		delete(rl.connections, ip)
+	}
+}
+
+func (rl *RateLimiter) canAuth(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	cutoff := time.Now().Add(-time.Minute)
+	var recent []time.Time
+	for _, t := range rl.authAttempts[ip] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	rl.authAttempts[ip] = recent
+
+	if len(recent) >= rl.maxAuth {
+		return false
+	}
+
+	rl.authAttempts[ip] = append(rl.authAttempts[ip], time.Now())
+	return true
+}
+
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (for reverse proxies)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return xff
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
+var rateLimiter *RateLimiter
 
 // --- Models ---
 
@@ -32,20 +154,28 @@ type Message struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+type ReadReceiptPayload struct {
+	ConversationID int `json:"conversation_id"`
+}
+
+// ... existing types ...
+
 type Conversation struct {
 	ID           int       `json:"id"`
 	Name         *string   `json:"name,omitempty"`
 	IsGroup      bool      `json:"is_group"`
 	CreatedAt    time.Time `json:"created_at"`
 	Participants []string  `json:"participants,omitempty"`
+	UnreadCount  int       `json:"unread_count"` // New field
 }
 
 // --- WebSocket Hub ---
 
 type Client struct {
-	conn   *websocket.Conn
-	userID int
-	send   chan []byte
+	conn     *websocket.Conn
+	userID   int
+	username string
+	send     chan []byte
 }
 
 type Hub struct {
@@ -113,9 +243,9 @@ type SendMessagePayload struct {
 }
 
 type CreateConversationPayload struct {
-	Name        string   `json:"name,omitempty"`
-	IsGroup     bool     `json:"is_group"`
-	Usernames   []string `json:"usernames"`
+	Name      string   `json:"name,omitempty"`
+	IsGroup   bool     `json:"is_group"`
+	Usernames []string `json:"usernames"`
 }
 
 type CheckUserPayload struct {
@@ -245,7 +375,14 @@ func createConversation(creatorID int, payload CreateConversationPayload) (*Conv
 
 func getUserConversations(userID int) ([]Conversation, error) {
 	rows, err := db.Query(`
-		SELECT c.id, c.name, c.is_group, c.created_at
+		SELECT 
+			c.id, 
+			c.name, 
+			c.is_group, 
+			c.created_at,
+			(SELECT COUNT(*) FROM messages m 
+			 WHERE m.conversation_id = c.id 
+			 AND m.created_at > cp.last_read_at) as unread_count
 		FROM conversations c
 		JOIN conversation_participants cp ON c.id = cp.conversation_id
 		WHERE cp.user_id = $1
@@ -259,12 +396,43 @@ func getUserConversations(userID int) ([]Conversation, error) {
 	var convs []Conversation
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Name, &c.IsGroup, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.IsGroup, &c.CreatedAt, &c.UnreadCount); err != nil {
 			continue
 		}
 		convs = append(convs, c)
 	}
 	return convs, nil
+}
+
+func addParticipant(convID int, username string) error {
+	exists, userID := checkUserExists(username)
+	if !exists {
+		return fmt.Errorf("user %s not found", username)
+	}
+	_, err := db.Exec(
+		"INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+		convID, userID,
+	)
+	return err
+}
+
+func renameConversation(convID int, newName string) error {
+	_, err := db.Exec("UPDATE conversations SET name = $1 WHERE id = $2", newName, convID)
+	return err
+}
+
+func leaveConversation(userID, convID int) error {
+	_, err := db.Exec("DELETE FROM conversation_participants WHERE user_id = $1 AND conversation_id = $2", userID, convID)
+	return err
+}
+
+func updateReadReceipt(userID, conversationID int) error {
+	_, err := db.Exec(`
+		UPDATE conversation_participants
+		SET last_read_at = NOW()
+		WHERE user_id = $1 AND conversation_id = $2
+	`, userID, conversationID)
+	return err
 }
 
 func getConversationMessages(convID int, limit int) ([]Message, error) {
@@ -324,11 +492,22 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	clientIP := getClientIP(r)
+
+	// Rate limit: check connection count per IP
+	if !rateLimiter.canConnect(clientIP) {
+		http.Error(w, "Too many connections from your IP", http.StatusTooManyRequests)
+		log.Printf("Rate limited connection from %s", clientIP)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Upgrade error:", err)
 		return
 	}
+
+	rateLimiter.addConnection(clientIP)
 
 	client := &Client{
 		conn: conn,
@@ -337,7 +516,10 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	// Writer goroutine
 	go func() {
-		defer conn.Close()
+		defer func() {
+			rateLimiter.removeConnection(clientIP)
+			conn.Close()
+		}()
 		for msg := range client.send {
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
@@ -355,18 +537,36 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		log.Printf("Received message: %s", string(msgBytes)) // DEBUG
+
 		var wsMsg WSMessage
 		if err := json.Unmarshal(msgBytes, &wsMsg); err != nil {
+			log.Printf("JSON Unmarshal error: %v", err) // DEBUG
 			continue
 		}
 
+		log.Printf("Processing message type: %s", wsMsg.Type) // DEBUG
+
 		switch wsMsg.Type {
 		case "auth":
+			// Rate limit auth attempts
+			if !rateLimiter.canAuth(clientIP) {
+				log.Printf("Rate limit hit for %s", clientIP) // DEBUG
+				resp, _ := json.Marshal(map[string]interface{}{
+					"type":  "auth_error",
+					"error": "Too many login attempts. Please wait a minute.",
+				})
+				client.send <- resp
+				continue
+			}
+
 			var payload AuthPayload
 			json.Unmarshal(wsMsg.Payload, &payload)
+			log.Printf("Auth attempt: Action=%s User=%s", payload.Action, payload.Username) // DEBUG
 
 			userID, username, err := handleAuth(payload)
 			if err != nil {
+				log.Printf("Auth failed: %v", err) // DEBUG
 				resp, _ := json.Marshal(map[string]interface{}{
 					"type":  "auth_error",
 					"error": err.Error(),
@@ -375,7 +575,10 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			log.Printf("Auth success: UserID=%d User=%s", userID, username) // DEBUG
+
 			client.userID = userID
+			client.username = username
 			hub.register <- client
 
 			// Send success + conversations
@@ -387,6 +590,23 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 				"conversations": convs,
 			})
 			client.send <- resp
+
+		case "typing":
+			if client.userID == 0 {
+				continue
+			}
+			var payload struct {
+				ConversationID int `json:"conversation_id"`
+			}
+			json.Unmarshal(wsMsg.Payload, &payload)
+
+			resp, _ := json.Marshal(map[string]interface{}{
+				"type":            "typing",
+				"conversation_id": payload.ConversationID,
+				"user_id":         client.userID,
+				"username":        client.username,
+			})
+			hub.broadcast <- resp
 
 		case "check_user":
 			var payload CheckUserPayload
@@ -428,6 +648,10 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 				ConversationID int `json:"conversation_id"`
 			}
 			json.Unmarshal(wsMsg.Payload, &payload)
+
+			// Mark as read when fetching messages
+			updateReadReceipt(client.userID, payload.ConversationID)
+
 			msgs, _ := getConversationMessages(payload.ConversationID, 100)
 			resp, _ := json.Marshal(map[string]interface{}{
 				"type":            "messages",
@@ -435,6 +659,14 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 				"messages":        msgs,
 			})
 			client.send <- resp
+
+		case "read_receipt":
+			if client.userID == 0 {
+				continue
+			}
+			var payload ReadReceiptPayload
+			json.Unmarshal(wsMsg.Payload, &payload)
+			updateReadReceipt(client.userID, payload.ConversationID)
 
 		case "send_message":
 			if client.userID == 0 {
@@ -464,6 +696,63 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 				"conversations": convs,
 			})
 			client.send <- resp
+
+		case "add_participant":
+			if client.userID == 0 {
+				continue
+			}
+			var payload struct {
+				ConversationID int    `json:"conversation_id"`
+				Username       string `json:"username"`
+			}
+			json.Unmarshal(wsMsg.Payload, &payload)
+			err := addParticipant(payload.ConversationID, payload.Username)
+			if err != nil {
+				resp, _ := json.Marshal(map[string]interface{}{
+					"type": "error", "error": err.Error(),
+				})
+				client.send <- resp
+				continue
+			}
+			// Refresh conversations for the client
+			convs, _ := getUserConversations(client.userID)
+			resp, _ := json.Marshal(map[string]interface{}{
+				"type": "conversations", "conversations": convs,
+			})
+			client.send <- resp
+
+		case "rename_conversation":
+			if client.userID == 0 {
+				continue
+			}
+			var payload struct {
+				ConversationID int    `json:"conversation_id"`
+				Name           string `json:"name"`
+			}
+			json.Unmarshal(wsMsg.Payload, &payload)
+			renameConversation(payload.ConversationID, payload.Name)
+			// Refresh
+			convs, _ := getUserConversations(client.userID)
+			resp, _ := json.Marshal(map[string]interface{}{
+				"type": "conversations", "conversations": convs,
+			})
+			client.send <- resp
+
+		case "leave_conversation":
+			if client.userID == 0 {
+				continue
+			}
+			var payload struct {
+				ConversationID int `json:"conversation_id"`
+			}
+			json.Unmarshal(wsMsg.Payload, &payload)
+			leaveConversation(client.userID, payload.ConversationID)
+			// Refresh
+			convs, _ := getUserConversations(client.userID)
+			resp, _ := json.Marshal(map[string]interface{}{
+				"type": "conversations", "conversations": convs,
+			})
+			client.send <- resp
 		}
 	}
 }
@@ -472,6 +761,7 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initDB()
+	rateLimiter = newRateLimiter()
 
 	hub := newHub()
 	go hub.run()
@@ -488,9 +778,10 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "3567"
 	}
 
 	log.Printf("Server starting on :%s", port)
+	log.Printf("Rate limits: %d connections/IP, %d auth attempts/min", rateLimiter.maxConns, rateLimiter.maxAuth)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
