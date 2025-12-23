@@ -596,7 +596,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isLoading = true // Set loading
 					m.authError = ""   // Clear previous error
 					m.pendingPassword = m.passwordInput.Value()
-					m.serverURL = m.serverInput.Value()
+
+					// Sanitize URL: support https:// and http:// by converting to wss:// and ws://
+					url := m.serverInput.Value()
+					if strings.HasPrefix(url, "https://") {
+						url = "wss://" + strings.TrimPrefix(url, "https://")
+					} else if strings.HasPrefix(url, "http://") {
+						url = "ws://" + strings.TrimPrefix(url, "http://")
+					} else if !strings.HasPrefix(url, "ws://") && !strings.HasPrefix(url, "wss://") {
+						// Default to wss:// if no scheme provided
+						url = "wss://" + url
+					}
+					m.serverURL = url
 
 					debugLog("Attempting auth: Server=%s Action=%s User=%s", m.serverURL, m.authAction, m.usernameInput.Value())
 
