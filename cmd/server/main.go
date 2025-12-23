@@ -370,14 +370,27 @@ func createConversation(creatorID int, payload CreateConversationPayload) (*Conv
 		return nil, err
 	}
 
-	return &Conversation{ID: convID, Name: name, IsGroup: payload.IsGroup}, nil
+	// After commit, if it's a DM and name is null, fetch the other participant's name
+	finalName := name
+	if !payload.IsGroup && name == nil && len(payload.Usernames) > 0 {
+		n := payload.Usernames[0]
+		finalName = &n
+	}
+
+	return &Conversation{ID: convID, Name: finalName, IsGroup: payload.IsGroup}, nil
 }
 
 func getUserConversations(userID int) ([]Conversation, error) {
 	rows, err := db.Query(`
 		SELECT 
 			c.id, 
-			c.name, 
+			COALESCE(c.name, (
+				SELECT u.username 
+				FROM conversation_participants cp2 
+				JOIN users u ON cp2.user_id = u.id 
+				WHERE cp2.conversation_id = c.id AND cp2.user_id != $1 
+				LIMIT 1
+			)) as name, 
 			c.is_group, 
 			c.created_at,
 			(SELECT COUNT(*) FROM messages m 
@@ -397,6 +410,7 @@ func getUserConversations(userID int) ([]Conversation, error) {
 	for rows.Next() {
 		var c Conversation
 		if err := rows.Scan(&c.ID, &c.Name, &c.IsGroup, &c.CreatedAt, &c.UnreadCount); err != nil {
+			log.Printf("Error scanning conversation: %v", err)
 			continue
 		}
 		convs = append(convs, c)

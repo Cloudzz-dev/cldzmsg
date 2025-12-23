@@ -667,8 +667,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.messages = nil // Clear previous messages
 						m.updateChatViewport()
 
-						if conv.Name != nil {
+						if conv.Name != nil && *conv.Name != "" {
 							m.currentConvName = *conv.Name
+						} else if conv.IsGroup {
+							m.currentConvName = fmt.Sprintf("Group #%d", conv.ID)
 						} else {
 							m.currentConvName = fmt.Sprintf("DM #%d", conv.ID)
 						}
@@ -1173,11 +1175,13 @@ func (m model) sidebarView() string {
 		s.WriteString(mutedStyle.Render("No conversations.\n'n' to create."))
 	} else {
 		for i, conv := range m.conversations {
-			name := "DM"
-			if conv.Name != nil {
+			name := ""
+			if conv.Name != nil && *conv.Name != "" {
 				name = *conv.Name
+			} else if conv.IsGroup {
+				name = fmt.Sprintf("Group #%d", conv.ID)
 			} else {
-				name = fmt.Sprintf("Conv #%d", conv.ID)
+				name = fmt.Sprintf("DM #%d", conv.ID)
 			}
 			// Icon
 			icon := "👤"
