@@ -4,10 +4,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -47,6 +54,75 @@ func getConfigDir() string {
 	return filepath.Join(home, ".config", "cldzmsg", profileName)
 }
 
+func getEncryptionKey() []byte {
+	// Try multiple locations for machine-id
+	paths := []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}
+	var id string
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			id = strings.TrimSpace(string(data))
+			break
+		}
+	}
+
+	if id == "" {
+		// Fallback to hostname if machine-id is not available
+		hostname, _ := os.Hostname()
+		id = hostname
+	}
+
+	hash := sha256.Sum256([]byte(id))
+	return hash[:]
+}
+
+func encrypt(data []byte) (string, error) {
+	key := getEncryptionKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, data, nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+func decrypt(encoded string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+
+	key := getEncryptionKey()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
 func loadSession() *Session {
 	configDir := getConfigDir()
 	if configDir == "" {
@@ -58,8 +134,21 @@ func loadSession() *Session {
 		return nil
 	}
 
+	// Try to decrypt
+	decrypted, err := decrypt(string(data))
+	if err != nil {
+		// Fallback for migration: try to parse as plain JSON
+		var session Session
+		if err := json.Unmarshal(data, &session); err == nil {
+			// Migration: re-save encrypted immediately
+			saveSession(session.Username, session.Password)
+			return &session
+		}
+		return nil
+	}
+
 	var session Session
-	if err := json.Unmarshal(data, &session); err != nil {
+	if err := json.Unmarshal(decrypted, &session); err != nil {
 		return nil
 	}
 	return &session
@@ -81,7 +170,12 @@ func saveSession(username, password string) error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(configDir, "session.json"), data, 0600)
+	encrypted, err := encrypt(data)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(configDir, "session.json"), []byte(encrypted), 0600)
 }
 
 func clearSession() {
