@@ -2,7 +2,8 @@
 
 A terminal-based real-time messaging application built with Go.
 
-![TUI Preview](https://via.placeholder.com/800x400?text=Terminal+Messaging+App)
+![Login Screen](screenshot_23122025_140252.jpg)
+![Chat Interface](screenshot_23122025_140209.jpg)
 
 ## Features
 
