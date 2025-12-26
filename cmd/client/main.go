@@ -4,304 +4,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
-
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cloudzz-dev/cldzmsg/internal/client/debug"
+	"github.com/cloudzz-dev/cldzmsg/internal/client/session"
+	"github.com/cloudzz-dev/cldzmsg/internal/client/ui/styles"
 	"github.com/gorilla/websocket"
 )
 
-// --- Session Persistence ---
-
-type Session struct {
-	ServerURL string `json:"server_url"`
-	Username  string `json:"username"`
-	Password  string `json:"password"` // Stored for auto-login (consider encrypting in production)
-}
-
 var profileName = "default"
-var debugMode = false
-
-// debugLog writes to debug.log only if debug mode is enabled
-func debugLog(format string, args ...interface{}) {
-	if !debugMode {
-		return
-	}
-	f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, format+"\n", args...)
-}
-
-func getConfigDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".config", "cldzmsg", profileName)
-}
-
-func getEncryptionKey() []byte {
-	// Try multiple locations for machine-id
-	paths := []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}
-	var id string
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err == nil {
-			id = strings.TrimSpace(string(data))
-			break
-		}
-	}
-
-	if id == "" {
-		// Fallback to hostname if machine-id is not available
-		hostname, _ := os.Hostname()
-		id = hostname
-	}
-
-	hash := sha256.Sum256([]byte(id))
-	return hash[:]
-}
-
-func encrypt(data []byte) (string, error) {
-	key := getEncryptionKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, data, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
-}
-
-func decrypt(encoded string) ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, err
-	}
-
-	key := getEncryptionKey()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(data) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
-}
-
-func loadSession() *Session {
-	configDir := getConfigDir()
-	if configDir == "" {
-		return nil
-	}
-
-	data, err := os.ReadFile(filepath.Join(configDir, "session.json"))
-	if err != nil {
-		return nil
-	}
-
-	// Try to decrypt
-	decrypted, err := decrypt(string(data))
-	if err != nil {
-		// Fallback for migration: try to parse as plain JSON
-		var session Session
-		if err := json.Unmarshal(data, &session); err == nil {
-			// Migration: re-save encrypted immediately
-			saveSession(session.ServerURL, session.Username, session.Password)
-			return &session
-		}
-		return nil
-	}
-
-	var session Session
-	if err := json.Unmarshal(decrypted, &session); err != nil {
-		return nil
-	}
-	return &session
-}
-
-func saveSession(serverURL, username, password string) error {
-	configDir := getConfigDir()
-	if configDir == "" {
-		return fmt.Errorf("could not get config directory")
-	}
-
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return err
-	}
-
-	session := Session{ServerURL: serverURL, Username: username, Password: password}
-	data, err := json.Marshal(session)
-	if err != nil {
-		return err
-	}
-
-	encrypted, err := encrypt(data)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filepath.Join(configDir, "session.json"), []byte(encrypted), 0600)
-}
-
-func clearSession() {
-	configDir := getConfigDir()
-	if configDir != "" {
-		os.Remove(filepath.Join(configDir, "session.json"))
-	}
-}
-
-// --- Styles ---
-
-var (
-	primaryColor   = lipgloss.Color("#7C3AED")
-	secondaryColor = lipgloss.Color("#10B981") // Green for self
-	bgColor        = lipgloss.Color("#1F2937")
-	mutedColor     = lipgloss.Color("#9CA3AF")
-	errorColor     = lipgloss.Color("#EF4444")
-	activeBorder   = lipgloss.Color("#F59E0B") // Amber for focus
-
-	// App container
-	_ = lipgloss.NewStyle().Padding(1, 2)
-
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(primaryColor).
-			Padding(0, 1)
-
-	profileStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#34D399")). // Emerald
-			Bold(true)
-
-	// Utils
-	mutedStyle = lipgloss.NewStyle().
-			Foreground(mutedColor)
-
-	errorStyle = lipgloss.NewStyle().
-			Foreground(errorColor).
-			Bold(true)
-
-	boxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(primaryColor).
-			Padding(1, 2)
-
-	_ = lipgloss.NewStyle().
-		Foreground(mutedColor).
-		Italic(true)
-
-	// Sidebar styles
-	sidebarStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(primaryColor).
-			Padding(0, 1).
-			MarginRight(1)
-
-	selectedItemStyle = lipgloss.NewStyle().
-				Foreground(secondaryColor).
-				Bold(true).
-				PaddingLeft(1).
-				Border(lipgloss.NormalBorder(), false, false, false, true).
-				BorderForeground(secondaryColor)
-
-	unselectedItemStyle = lipgloss.NewStyle().
-				PaddingLeft(2) // Match indentation of selected items
-
-	// Chat styles
-	chatWindowStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(primaryColor)
-
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Border(lipgloss.NormalBorder(), false, false, true, false).
-			BorderForeground(mutedColor).
-			Padding(0, 1).
-			Width(100) // Will be updated dynamically
-
-	footerStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), true, false, false, false).
-			BorderForeground(mutedColor).
-			Padding(0, 1)
-
-	// Message Bubbles
-	_ = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(secondaryColor).
-		Padding(0, 1).
-		MarginTop(1).
-		MarginLeft(4). // Indent from left
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(secondaryColor)
-
-	_ = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(primaryColor).
-		Padding(0, 1).
-		MarginTop(1).
-		MarginRight(4). // Indent from right
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(primaryColor)
-
-	// Legacy styles for compatibility
-	ownMessageStyle = lipgloss.NewStyle().
-			Foreground(secondaryColor)
-	otherMessageStyle = lipgloss.NewStyle().
-				Foreground(primaryColor)
-
-	// Legacy selected style
-	_ = lipgloss.NewStyle().
-		Foreground(secondaryColor).
-		Bold(true)
-
-	_ = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#D1D5DB")). // Light gray
-		Faint(true)
-)
-
-const asciiArt = `
-  ██████╗██╗     ██████╗ ███████╗███╗   ███╗███████╗ ██████╗ 
- ██╔════╝██║     ██╔══██╗╚══███╔╝████╗ ████║██╔════╝██╔════╝ 
- ██║     ██║     ██║  ██║  ███╔╝ ██╔████╔██║███████╗██║  ███╗
- ██║     ██║     ██║  ██║ ███╔╝  ██║╚██╔╝██║╚════██║██║   ██║
- ╚██████╗███████╗██████╔╝███████╗██║ ╚═╝ ██║███████║╚██████╔╝
-  ╚═════╝╚══════╝╚═════╝ ╚══════╝╚═╝     ╚═╝╚══════╝ ╚═════╝ 
-`
 
 // --- View State ---
 
@@ -311,16 +28,6 @@ const (
 	paneSidebar pane = iota
 	paneChat
 	paneAuth // Special pane for full-screen auth
-)
-
-// Legacy view state (for compatibility if needed, though we should migrate)
-type viewState int
-
-const (
-	viewAuth viewState = iota
-	viewConversations
-	viewChat
-	viewNewConversation
 )
 
 // --- Models ---
@@ -385,9 +92,10 @@ type model struct {
 	passwordInput   textinput.Model
 	authFocused     int // 0=server, 1=username, 2=password
 	authError       string
-	isLoading       bool     // New: Track auth request state
-	savedSession    *Session // For auto-login
-	pendingPassword string   // Password to save after successful auth
+	isLoading       bool             // New: Track auth request state
+	savedSession    *session.Session // For auto-login
+
+pendingPassword string           // Password to save after successful auth
 
 	// Typing
 	lastTypingSent time.Time
@@ -434,16 +142,13 @@ type model struct {
 	// System
 	err            error
 	reconnectCount int
-
-	// Legacy view state
-	view viewState
 }
 
 type wsReconnect struct{}
 
 func initialModel(serverURL string) model {
 	// Load saved session
-	savedSession := loadSession()
+	savedSession := session.Load(profileName)
 
 	// Override default serverURL if saved session exists
 	if savedSession != nil && savedSession.ServerURL != "" {
@@ -512,8 +217,7 @@ func initialModel(serverURL string) model {
 		chatViewport:       chatViewport,
 		focusedPane:        paneAuth, // Start at auth
 		savedSession:       savedSession,
-		sidebarWidth:       30,       // Fixed sidebar width
-		view:               viewAuth, // Initialize legacy view state
+		sidebarWidth:       30, // Fixed sidebar width
 		typingUsers:        make(map[int]string),
 		lastReadMessageIDs: make(map[int]int),
 	}
@@ -523,7 +227,7 @@ func initialModel(serverURL string) model {
 
 func connectToServer(url string) tea.Cmd {
 	return func() tea.Msg {
-		debugLog("Dialing WebSocket: %s", url)
+		debug.Log("Dialing WebSocket: %s", url)
 
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 		if err != nil {
@@ -546,7 +250,7 @@ func listenForMessages(conn *websocket.Conn) tea.Cmd {
 func (m model) sendWSMessage(msgType string, payload interface{}) tea.Cmd {
 	return func() tea.Msg {
 		if m.conn == nil {
-			debugLog("FAILED to send message (%s): Connection is nil", msgType)
+			debug.Log("FAILED to send message (%s): Connection is nil", msgType)
 			return nil
 		}
 
@@ -677,7 +381,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Auth View Handling
 		if !m.authenticated {
-			debugLog("Key pressed: %q | Server: %q | User: %q | Pass: %q", msg.String(), m.serverInput.Value(), m.usernameInput.Value(), m.passwordInput.Value())
+			debug.Log("Key pressed: %q | Server: %q | User: %q | Pass: %q", msg.String(), m.serverInput.Value(), m.usernameInput.Value(), m.passwordInput.Value())
 
 			switch msg.String() {
 			case "tab":
@@ -701,7 +405,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.authAction = "login"
 				}
 			case "enter":
-				debugLog("Enter pressed. Values valid? %v", m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "")
+				debug.Log("Enter pressed. Values valid? %v", m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "")
 
 				if m.serverInput.Value() != "" && m.usernameInput.Value() != "" && m.passwordInput.Value() != "" {
 					m.isLoading = true // Set loading
@@ -720,7 +424,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.serverURL = url
 
-					debugLog("Attempting auth: Server=%s Action=%s User=%s", m.serverURL, m.authAction, m.usernameInput.Value())
+					debug.Log("Attempting auth: Server=%s Action=%s User=%s", m.serverURL, m.authAction, m.usernameInput.Value())
 
 					// Connect to server, then auth will happen in wsConnected handler
 					return m, connectToServer(m.serverURL)
@@ -810,7 +514,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.newConvUsers = []string{}
 			// Provide logout option
 			case "L":
-				clearSession()
+				session.Clear(profileName)
 				return m, tea.Quit // Or reset state to auth, but quit is safer for now
 			}
 
@@ -883,14 +587,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sidebarWidth = 25
 		}
 
-		sidebarStyle = sidebarStyle.Width(m.sidebarWidth - 2).Height(m.height - 2) // -2 for borders/padding
+		styles.SidebarStyle = styles.SidebarStyle.Width(m.sidebarWidth - 2).Height(m.height - 2) // -2 for borders/padding
 
 		chatWidth := m.width - m.sidebarWidth - 4 // -4 for margins/borders
 		chatHeight := m.height - 2
 
-		chatWindowStyle = chatWindowStyle.Width(chatWidth).Height(chatHeight)
-		headerStyle = headerStyle.Width(chatWidth - 2)
-		footerStyle = footerStyle.Width(chatWidth - 2)
+		styles.ChatWindowStyle = styles.ChatWindowStyle.Width(chatWidth).Height(chatHeight)
+		styles.HeaderStyle = styles.HeaderStyle.Width(chatWidth - 2)
+		styles.FooterStyle = styles.FooterStyle.Width(chatWidth - 2)
 
 		// Viewport takes remaining height: Total - Header - Footer - Borders
 		viewportHeight := chatHeight - 4 - 3 // Approximate
@@ -900,7 +604,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateChatViewport()
 
 	case wsConnected:
-		debugLog("WebSocket Connected successfully to %s", m.serverURL)
+		debug.Log("WebSocket Connected successfully to %s", m.serverURL)
 
 		m.conn = msg.conn
 		m.connected = true
@@ -938,7 +642,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.connected = false
 		m.conn = nil
 
-		debugLog("WebSocket Connection Error (Count: %d): %v", m.reconnectCount, msg.err)
+		debug.Log("WebSocket Connection Error (Count: %d): %v", m.reconnectCount, msg.err)
 
 		if m.reconnectCount < 5 {
 			m.reconnectCount++
@@ -957,17 +661,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, connectToServer(m.serverURL)
 
 	case wsIncoming:
-		debugLog("Received WS Message: %s", string(msg.data))
+		debug.Log("Received WS Message: %s", string(msg.data))
 
 		var wsMsg struct {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(msg.data, &wsMsg); err != nil {
-			debugLog("JSON Error: %v", err)
+			debug.Log("JSON Error: %v", err)
 			return m, nil
 		}
 
-		debugLog("Processing Message Type: %s", wsMsg.Type)
+		debug.Log("Processing Message Type: %s", wsMsg.Type)
 
 		switch wsMsg.Type {
 		case "auth_success":
@@ -979,15 +683,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			json.Unmarshal(msg.data, &resp)
 			m.userID = resp.UserID
-			m.username = resp.Username
-			m.conversations = resp.Conversations
-			m.authenticated = true
-			m.focusedPane = paneSidebar
-			m.authError = ""
+		m.username = resp.Username
+		m.conversations = resp.Conversations
+		m.authenticated = true
+		m.focusedPane = paneSidebar
+		m.authError = ""
 
 			// Save session for future auto-login
 			if m.pendingPassword != "" {
-				saveSession(m.serverURL, resp.Username, m.pendingPassword)
+				session.Save(profileName, m.serverURL, resp.Username, m.pendingPassword)
 				m.pendingPassword = ""
 			}
 
@@ -1001,7 +705,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Clear saved session if auto-login failed
 			if m.savedSession != nil {
-				clearSession()
+				session.Clear(profileName)
 				m.savedSession = nil
 			}
 
@@ -1058,12 +762,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.conversations = append([]Conversation{conv}, m.conversations...)
 
 				// Adjust selected index
-				if m.selectedConv == foundIdx {
-					m.selectedConv = 0
-				} else if foundIdx > m.selectedConv {
-					// Conv below moved to top, our index shifts down
-					m.selectedConv++
-				}
+			if m.selectedConv == foundIdx {
+				m.selectedConv = 0
+			} else if foundIdx > m.selectedConv {
+				// Conv below moved to top, our index shifts down
+				m.selectedConv++
+			}
 			}
 
 			if resp.Message.ConversationID == m.currentConvID {
@@ -1122,9 +826,9 @@ func (m *model) renderChatContent() string {
 		timestamp := formatRelativeTime(msg.CreatedAt)
 		var style lipgloss.Style
 		if msg.SenderID == m.userID {
-			style = ownMessageStyle
+			style = styles.OwnMessageStyle
 		} else {
-			style = otherMessageStyle
+			style = styles.OtherMessageStyle
 		}
 
 		// Wrap text based on viewport width
@@ -1136,7 +840,7 @@ func (m *model) renderChatContent() string {
 		wrappedContent := fitString(msg.Content, maxWidth)
 
 		line := fmt.Sprintf("%s %s: %s",
-			mutedStyle.Render(timestamp),
+			styles.MutedStyle.Render(timestamp),
 			style.Render(msg.SenderUsername),
 			wrappedContent,
 		)
@@ -1180,7 +884,7 @@ func fitString(s string, width int) string {
 
 func (m model) View() string {
 	if m.err != nil {
-		return errorStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
+		return styles.ErrorStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
 	}
 
 	if !m.authenticated {
@@ -1210,21 +914,21 @@ func (m model) overlayHelp() string {
 	height := 16
 
 	var s strings.Builder
-	s.WriteString(titleStyle.Render("Help & Controls") + "\n\n")
+	s.WriteString(styles.TitleStyle.Render("Help & Controls") + "\n\n")
 
 	// Two distinct columns
-	s.WriteString(profileStyle.Render("Sidebar") + "\n")
+	s.WriteString(styles.ProfileStyle.Render("Sidebar") + "\n")
 	s.WriteString("  ↑/k, ↓/j  Navigate\n")
 	s.WriteString("  Enter/l   Select Chat\n")
 	s.WriteString("  n         New Chat\n")
 	s.WriteString("  L         Logout\n\n")
 
-	s.WriteString(profileStyle.Render("Chat") + "\n")
+	s.WriteString(styles.ProfileStyle.Render("Chat") + "\n")
 	s.WriteString("  Types     Type message\n")
 	s.WriteString("  Enter     Send\n")
 	s.WriteString("  Esc       Back to Sidebar\n\n")
 
-	s.WriteString(profileStyle.Render("Global") + "\n")
+	s.WriteString(styles.ProfileStyle.Render("Global") + "\n")
 	s.WriteString("  ?         Toggle Help\n")
 	s.WriteString("  Ctrl+C    Quit\n")
 	s.WriteString("  Tab       Switch Focus")
@@ -1232,8 +936,8 @@ func (m model) overlayHelp() string {
 	modal := lipgloss.NewStyle().
 		Width(width).Height(height).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(activeBorder).
-		Background(bgColor).
+		BorderForeground(styles.ActiveBorder).
+		Background(styles.BgColor).
 		Padding(1, 2).
 		Render(s.String())
 
@@ -1251,29 +955,29 @@ func (m model) overlayInfo() string {
 	height := 14
 
 	var s strings.Builder
-	s.WriteString(titleStyle.Render("Conversation Options") + "\n\n")
+	s.WriteString(styles.TitleStyle.Render("Conversation Options") + "\n\n")
 
 	switch m.infoMode {
 	case "":
 		s.WriteString("  [r] Rename Group\n")
 		s.WriteString("  [a] Add User\n")
 		s.WriteString("  [L] Leave Conversation\n\n")
-		s.WriteString(mutedStyle.Render("  Esc to cancel"))
+		s.WriteString(styles.MutedStyle.Render("  Esc to cancel"))
 	case "rename":
 		s.WriteString("New Name:\n")
 		s.WriteString(m.infoInput.View())
-		s.WriteString("\n\n" + mutedStyle.Render("Enter to save, Esc to cancel"))
+		s.WriteString("\n\n" + styles.MutedStyle.Render("Enter to save, Esc to cancel"))
 	case "add_user":
 		s.WriteString("Add User:\n")
 		s.WriteString(m.infoInput.View())
-		s.WriteString("\n\n" + mutedStyle.Render("Enter to add, Esc to cancel"))
+		s.WriteString("\n\n" + styles.MutedStyle.Render("Enter to add, Esc to cancel"))
 	}
 
 	modal := lipgloss.NewStyle().
 		Width(width).Height(height).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(activeBorder).
-		Background(bgColor).
+		BorderForeground(styles.ActiveBorder).
+		Background(styles.BgColor).
 		Padding(1, 2).
 		Render(s.String())
 
@@ -1283,18 +987,18 @@ func (m model) overlayInfo() string {
 func (m model) sidebarView() string {
 	var s strings.Builder
 
-	borderColor := mutedColor
+	borderColor := styles.MutedColor
 	if m.focusedPane == paneSidebar {
-		borderColor = activeBorder
+		borderColor = styles.ActiveBorder
 	}
 
-	style := sidebarStyle.Copy().BorderForeground(borderColor)
+	style := styles.SidebarStyle.Copy().BorderForeground(borderColor)
 
-	s.WriteString(titleStyle.Render(fmt.Sprintf("%s (%s)", m.username, profileName)))
+	s.WriteString(styles.TitleStyle.Render(fmt.Sprintf("%s (%s)", m.username, profileName)))
 	s.WriteString("\n\n")
 
 	if len(m.conversations) == 0 {
-		s.WriteString(mutedStyle.Render("No conversations.\n'n' to create."))
+		s.WriteString(styles.MutedStyle.Render("No conversations.\n'n' to create."))
 	} else {
 		for i, conv := range m.conversations {
 			name := ""
@@ -1314,15 +1018,15 @@ func (m model) sidebarView() string {
 			// Unread Badge
 			unread := ""
 			if conv.UnreadCount > 0 {
-				unread = errorStyle.Render(fmt.Sprintf(" (%d)", conv.UnreadCount))
+				unread = styles.ErrorStyle.Render(fmt.Sprintf(" (%d)", conv.UnreadCount))
 			}
 
 			line := fmt.Sprintf("%s %s%s", icon, name, unread)
 
 			if i == m.selectedConv {
-				s.WriteString(selectedItemStyle.Render(line) + "\n")
+				s.WriteString(styles.SelectedItemStyle.Render(line) + "\n")
 			} else {
-				s.WriteString(unselectedItemStyle.Render(line) + "\n")
+				s.WriteString(styles.UnselectedItemStyle.Render(line) + "\n")
 			}
 		}
 	}
@@ -1338,19 +1042,19 @@ func (m model) chatWindowView() string {
 	}
 
 	if m.currentConvID == 0 {
-		return chatWindowStyle.Render(
+		return styles.ChatWindowStyle.Render(
 			lipgloss.Place(
 				m.width-m.sidebarWidth-6,
 				m.height-4,
 				lipgloss.Center, lipgloss.Center,
-				mutedStyle.Render("Select a conversation to start chatting"),
+				styles.MutedStyle.Render("Select a conversation to start chatting"),
 			),
 		)
 	}
 
-	borderColor := mutedColor
+	borderColor := styles.MutedColor
 	if m.focusedPane == paneChat {
-		borderColor = activeBorder
+		borderColor = styles.ActiveBorder
 	}
 
 	// Header
@@ -1358,7 +1062,7 @@ func (m model) chatWindowView() string {
 	if m.isReconnecting {
 		headerText = fmt.Sprintf("⟳ Reconnecting (%d/5)... | %s", m.reconnectCount, m.currentConvName)
 	}
-	header := headerStyle.Render(headerText)
+	header := styles.HeaderStyle.Render(headerText)
 
 	// Typing Status
 	typingStatus := ""
@@ -1367,7 +1071,7 @@ func (m model) chatWindowView() string {
 		for _, name := range m.typingUsers {
 			names = append(names, name)
 		}
-		typingStatus = mutedStyle.Render(fmt.Sprintf(" %s typing...", strings.Join(names, ", ")))
+		typingStatus = styles.MutedStyle.Render(fmt.Sprintf(" %s typing...", strings.Join(names, ", ")))
 	}
 
 	// Footer (Input)
@@ -1375,7 +1079,7 @@ func (m model) chatWindowView() string {
 	if typingStatus != "" {
 		footerContent = typingStatus + "\n" + footerContent
 	}
-	footer := footerStyle.Render(footerContent)
+	footer := styles.FooterStyle.Render(footerContent)
 
 	// Viewport rendered string
 	vp := m.chatViewport.View()
@@ -1388,7 +1092,7 @@ func (m model) chatWindowView() string {
 		footer,
 	)
 
-	return chatWindowStyle.Copy().BorderForeground(borderColor).Render(content)
+	return styles.ChatWindowStyle.Copy().BorderForeground(borderColor).Render(content)
 }
 
 func (m model) authView() string {
@@ -1396,12 +1100,12 @@ func (m model) authView() string {
 	var s strings.Builder
 
 	// Render ASCII Art
-	banner := titleStyle.Foreground(primaryColor).Render(asciiArt)
+	banner := styles.TitleStyle.Foreground(styles.PrimaryColor).Render(styles.AsciiArt)
 	s.WriteString(banner + "\n\n")
 
-	s.WriteString("Profile: " + profileStyle.Render(profileName) + "\n\n")
+	s.WriteString("Profile: " + styles.ProfileStyle.Render(profileName) + "\n\n")
 
-	action := m.authAction
+action := m.authAction
 	if action == "login" {
 		s.WriteString("→ Login / Register\n\n")
 	} else {
@@ -1413,21 +1117,21 @@ func (m model) authView() string {
 	s.WriteString("Password: " + m.passwordInput.View() + "\n\n")
 
 	if m.authError != "" {
-		s.WriteString(errorStyle.Render(m.authError) + "\n")
+		s.WriteString(styles.ErrorStyle.Render(m.authError) + "\n")
 	}
 
 	if m.isLoading {
-		s.WriteString(mutedStyle.Render("Connecting..."))
+		s.WriteString(styles.MutedStyle.Render("Connecting..."))
 	} else {
-		s.WriteString(mutedStyle.Render("Enter to Submit • Tab to Switch Field • Ctrl+R Toggle Mode"))
+		s.WriteString(styles.MutedStyle.Render("Enter to Submit • Tab to Switch Field • Ctrl+R Toggle Mode"))
 	}
 
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, boxStyle.Render(s.String()))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, styles.BoxStyle.Render(s.String()))
 }
 
 func (m model) newConversationView() string {
 	var s strings.Builder
-	s.WriteString(titleStyle.Render("New Conversation") + "\n\n")
+	s.WriteString(styles.TitleStyle.Render("New Conversation") + "\n\n")
 
 	if m.newConvIsGroup {
 		s.WriteString("Type: Group (Ctrl+G to toggle)\n")
@@ -1447,7 +1151,7 @@ func (m model) newConversationView() string {
 	s.WriteString("\n(Ctrl+S to Create, Esc to Cancel)")
 
 	// Render as a centered modal
-	return lipgloss.Place(m.width-m.sidebarWidth-6, m.height-4, lipgloss.Center, lipgloss.Center, boxStyle.Render(s.String()))
+	return lipgloss.Place(m.width-m.sidebarWidth-6, m.height-4, lipgloss.Center, lipgloss.Center, styles.BoxStyle.Render(s.String()))
 }
 
 // --- Main ---
@@ -1455,7 +1159,7 @@ func (m model) newConversationView() string {
 func main() {
 	// Parse flags
 	flag.StringVar(&profileName, "profile", "default", "Profile name for session isolation")
-	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging to debug.log")
+	flag.BoolVar(&debug.Enabled, "debug", false, "Enable debug logging to debug.log")
 	flag.Parse()
 
 	serverURL := os.Getenv("CLDZMSG_SERVER")

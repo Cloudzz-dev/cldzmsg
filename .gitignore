@@ -1,0 +1,19 @@
+# Binaries
+cldzmsg
+server
+*.exe
+*.test
+*.out
+
+# Logs
+*.log
+debug.log
+
+# Environment & Config
+.env
+config.json
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
