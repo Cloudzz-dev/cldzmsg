@@ -484,6 +484,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedConv < len(m.conversations)-1 {
 					m.selectedConv++
 				}
+			case "r":
+				if len(m.conversations) > 0 {
+					m.showInfo = true
+					m.infoMode = "rename"
+					m.infoInput.Placeholder = "New name..."
+					m.infoInput.Focus()
+					m.infoInput.SetValue("")
+					return m, nil
+				}
 			case "enter", "l", "right":
 				if len(m.conversations) > 0 {
 					conv := m.conversations[m.selectedConv]
@@ -959,7 +968,7 @@ func (m model) overlayInfo() string {
 
 	switch m.infoMode {
 	case "":
-		s.WriteString("  [r] Rename Group\n")
+		s.WriteString("  [r] Rename Conversation\n")
 		s.WriteString("  [a] Add User\n")
 		s.WriteString("  [L] Leave Conversation\n\n")
 		s.WriteString(styles.MutedStyle.Render("  Esc to cancel"))
