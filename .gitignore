@@ -1,5 +1,6 @@
 # Binaries
 cldzmsg
+client
 server
 *.exe
 *.test
