@@ -2,7 +2,7 @@
 set -e
 
 APP_NAME="cldzmsg"
-VERSION="v0.1.0"
+VERSION="v0.1.1"
 DIST_DIR="dist"
 
 # Clean up
