@@ -1,7 +1,7 @@
 # Binaries
-cldzmsg
-client
-server
+/cldzmsg
+/client
+/server
 *.exe
 *.test
 *.out
@@ -18,3 +18,4 @@ config.json
 .vscode/
 .idea/
 *.swp
+dist/
