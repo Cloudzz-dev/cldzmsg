@@ -75,11 +75,34 @@ else
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${LATEST}/cldzmsg-${OS}-${ARCH}"
     
     echo -e "${BLUE}Downloading ${LATEST}...${NC}"
-    curl -sL "$DOWNLOAD_URL" -o "/tmp/${BINARY_NAME}"
-    
-    echo -e "${BLUE}Installing to ${INSTALL_DIR}...${NC}"
-    sudo mv "/tmp/${BINARY_NAME}" "$INSTALL_DIR/"
-    sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    if curl -sL --fail "$DOWNLOAD_URL" -o "/tmp/${BINARY_NAME}"; then
+        echo -e "${BLUE}Installing to ${INSTALL_DIR}...${NC}"
+        sudo mv "/tmp/${BINARY_NAME}" "$INSTALL_DIR/"
+        sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    else
+        echo -e "${YELLOW}Binary download failed. Falling back to build from source...${NC}"
+        
+        # Check for Go
+        if ! command -v go &> /dev/null; then
+            echo -e "${RED}Error: Go is required to build from source.${NC}"
+            echo -e "Install Go: ${BLUE}sudo pacman -S go${NC} (Arch) or ${BLUE}sudo apt install golang${NC} (Debian/Ubuntu)"
+            exit 1
+        fi
+        
+        TEMP_DIR=$(mktemp -d)
+        echo -e "${BLUE}Cloning repository...${NC}"
+        git clone --depth 1 "https://github.com/${REPO}.git" "$TEMP_DIR"
+        cd "$TEMP_DIR"
+        
+        echo -e "${BLUE}Building client...${NC}"
+        go build -o "$BINARY_NAME" ./cmd/client
+        
+        echo -e "${BLUE}Installing to ${INSTALL_DIR}...${NC}"
+        sudo mv "$BINARY_NAME" "$INSTALL_DIR/"
+        
+        cd -
+        rm -rf "$TEMP_DIR"
+    fi
 fi
 
 echo -e "${GREEN}"
